@@ -1,5 +1,4 @@
-import akka.NotUsed
-import akka.actor.typed.scaladsl.{ActorContext, Behaviors}
+import akka.{Done, NotUsed}
 import akka.actor.typed.{ActorSystem, Props, _}
 import akka.persistence.typed.PersistenceId
 import akka.persistence.typed.scaladsl.{Effect, EventSourcedBehavior}
@@ -13,12 +12,14 @@ import akka.persistence.query.{EventEnvelope, PersistenceQuery}
 import akka.persistence.typed.PersistenceId
 import akka.persistence.typed.scaladsl.{Effect, EventSourcedBehavior}
 import akka.stream.ActorMaterializer
-import akka.stream.scaladsl.Source
+import akka.stream.scaladsl.{Flow, Sink, Source}
 import akka.actor.typed.ActorSystem
 import akka.actor.typed.scaladsl.Behaviors
+import akka.stream.alpakka.slick.scaladsl.{Slick, SlickSession}
 import akka_typed.CalculatorRepository.{getLatestOffsetAndResult, initDataBase, updateResultAndOfsset}
 import akka_typed.TypedCalculatorWriteSide.{Add, Added, Command, Divide, Divided, Multiplied, Multiply}
 
+import scala.concurrent.Future
 import scala.concurrent.duration._
 import scala.io.StdIn
 import scala.util.{Failure, Success}
@@ -114,6 +115,7 @@ object akka_typed
     initDataBase
 
     implicit val materializer            = system.classicSystem
+    implicit val session = SlickSession.forConfig("slick-postgres")
     var (offset, latestCalculatedResult) = getLatestOffsetAndResult
     val startOffset: Int                 = if (offset == 1) 1 else offset + 1
 
@@ -136,30 +138,44 @@ object akka_typed
     val source: Source[EventEnvelope, NotUsed] = readJournal
       .eventsByPersistenceId("001", startOffset, Long.MaxValue)
 
-    source
-      .map{x =>
-        println(x.toString())
-        x
-      }
-      .runForeach { event =>
+    val flowShow = Flow[EventEnvelope].map{x =>
+      println(x.toString())
+      x
+    }
+
+    val flowRead = Flow[EventEnvelope].map{event =>
       event.event match {
         case Added(_, amount) =>
-//          println(s"!Before Log from Added: $latestCalculatedResult")
+          println(s"!Before Log from Added: $latestCalculatedResult")
           latestCalculatedResult += amount
-          updateResultAndOfsset(latestCalculatedResult, event.sequenceNr)
-          println(s"! Log from Added: $latestCalculatedResult")
         case Multiplied(_, amount) =>
-//          println(s"!Before Log from Multiplied: $latestCalculatedResult")
+          println(s"!Before Log from Multiplied: $latestCalculatedResult")
           latestCalculatedResult *= amount
-          updateResultAndOfsset(latestCalculatedResult, event.sequenceNr)
-          println(s"! Log from Multiplied: $latestCalculatedResult")
         case Divided(_, amount) =>
-//          println(s"! Log from Divided before: $latestCalculatedResult")
+          println(s"!Before Log from Divided before: $latestCalculatedResult")
           latestCalculatedResult /= amount
-          updateResultAndOfsset(latestCalculatedResult, event.sequenceNr)
-          println(s"! Log from Divided: $latestCalculatedResult")
       }
+      (event,latestCalculatedResult)
     }
+
+    import session.profile.api._
+    val slickSink: Sink[(EventEnvelope, Double), Future[Done]] = Slick.sink[(EventEnvelope,Double)]{ res: (EventEnvelope, Double) =>
+      res._1.event match {
+        case Added(_,_) =>
+          println(s"! Log from Added: ${res._2}")
+        case Multiplied(_,_) =>
+          println(s"! Log from Multiplied: ${res._2}")
+        case Divided(_,_) =>
+          println(s"! Log from Divided: ${res._2}")
+      }
+      sqlu"update public.result set calculated_value = ${res._2}, write_side_offset = ${res._1.sequenceNr} where id = 1"
+    }
+
+    source
+      .via(flowShow).async
+      .via(flowRead).async
+      .to(slickSink.async)
+      .run()
   }
 
   object CalculatorRepository {
@@ -196,9 +212,9 @@ object akka_typed
     Behaviors.setup { ctx =>
       val writeActorRef = ctx.spawn(TypedCalculatorWriteSide(), "Calculato", Props.empty)
 
-//      writeActorRef ! Add(10)
-//      writeActorRef ! Multiply(2)
-//      writeActorRef ! Divide(5)
+     writeActorRef ! Add(10)
+     writeActorRef ! Multiply(2)
+     writeActorRef ! Divide(5)
 
       // 0 + 10 = 10
       // 10 * 2 = 20
